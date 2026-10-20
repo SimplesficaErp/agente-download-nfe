@@ -227,11 +227,16 @@ function requisicaoLocalOk(req) {
   return /^(127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(host);
 }
 
-// Caminho local seguro: absoluto, sem UNC (\\servidor) nem device path (\\?\).
+// Caminho local seguro: absoluto, sem UNC nem device path. Rejeita UNC em
+// QUALQUER mistura de separador (\\srv, //srv, /\srv, \/srv) — no Windows um
+// caminho UNC vaza credencial NTLM / escreve em máquina remota.
 function caminhoLocalValido(p) {
   const s = String(p || '');
-  if (!s || s.startsWith('\\\\') || /^\\\\\?\\/.test(s) || s.includes('\0')) return false;
-  return /^[A-Za-z]:[\\/]/.test(s) || s.startsWith('/'); // C:\... ou /... (mac/linux)
+  if (!s || s.includes('\0')) return false;
+  if (/^[\\/]{2}/.test(s)) return false; // UNC (duas barras, qualquer mistura)
+  if (/^\\\\?\?\\/.test(s)) return false; // device path \\?\ ou \\.\
+  if (EH_WINDOWS) return /^[A-Za-z]:[\\/]/.test(s); // só C:\...
+  return s.startsWith('/'); // mac/linux: raiz
 }
 
 function enviarJson(res, status, dados, req) {
