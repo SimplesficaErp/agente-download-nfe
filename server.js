@@ -4,7 +4,8 @@
 // faz mTLS com a SEFAZ (NFeDistribuicaoDFe / consChNFe) e salva o XML.
 // Só módulos nativos do Node. Escuta só em 127.0.0.1.
 
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createReadStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -17,6 +18,8 @@ import { gunzipSync } from 'node:zlib';
 const PORT = Number(process.env.AGENTE_PORT) || 3131;
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const EH_WINDOWS = process.platform === 'win32';
+const execFileAsync = promisify(execFile);
+let seletorAberto = false;
 
 const SEFAZ = {
   1: 'https://www1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx',
@@ -297,23 +300,31 @@ const server = createServer(async (req, res) => {
   // Abre o seletor de pasta NATIVO do Windows e devolve o caminho escolhido.
   // (O navegador não consegue entregar um caminho ao agente; quem abre o
   // diálogo é o agente, que roda localmente.)
-  if (url.pathname === '/api/escolher-pasta' && req.method === 'GET') {
+  // POST + JSON obrigatório: chamada cross-site precisa de preflight (anti-CSRF).
+  // Assíncrono e um diálogo por vez: não trava o agente nem empilha janelas.
+  if (url.pathname === '/api/escolher-pasta' && req.method === 'POST') {
+    if (!String(req.headers['content-type'] || '').includes('application/json'))
+      return enviarJson(res, 415, { erro: 'Content-Type deve ser application/json' }, req);
     if (!EH_WINDOWS) return enviarJson(res, 400, { erro: 'seleção de pasta só no Windows' }, req);
+    if (seletorAberto) return enviarJson(res, 409, { erro: 'o seletor de pasta já está aberto' }, req);
     const ps =
       'Add-Type -AssemblyName System.Windows.Forms; ' +
       '$d = New-Object System.Windows.Forms.FolderBrowserDialog; ' +
       "$d.Description = 'Escolha a pasta para salvar os XMLs'; $d.ShowNewFolderButton = $true; " +
       '$d.RootFolder = [System.Environment+SpecialFolder]::MyComputer; ' +
       'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }';
+    seletorAberto = true;
     try {
-      const out = execFileSync(
+      const { stdout } = await execFileAsync(
         'powershell',
         ['-NoProfile', '-NonInteractive', '-STA', '-Command', ps],
         { encoding: 'utf-8', timeout: 180000 },
       );
-      return enviarJson(res, 200, { pasta: out.trim() || null }, req);
+      return enviarJson(res, 200, { pasta: stdout.trim() || null }, req);
     } catch (e) {
       return enviarJson(res, 400, { erro: `não foi possível abrir o seletor: ${e.message}` }, req);
+    } finally {
+      seletorAberto = false;
     }
   }
 
