@@ -134,7 +134,12 @@ function postSefaz(urlStr, envelope, pfxBuf, passphrase) {
         passphrase,
         minVersion: 'TLSv1.2',
         headers: {
-          'Content-Type': 'application/soap+xml; charset=utf-8',
+          // SOAP 1.2 exige o parâmetro `action` no Content-Type (não SOAPAction).
+          'Content-Type':
+            'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"',
+          // Sem User-Agent o WAF da Fazenda devolve HTTP 403. Mandar um.
+          'User-Agent': 'AgenteNFe/0.1 (+https://chaves-nfe.devgogroup.com)',
+          Accept: 'application/soap+xml, text/xml, */*',
           'Content-Length': body.length,
         },
         timeout: 30000,
@@ -287,6 +292,29 @@ const server = createServer(async (req, res) => {
 
   if (url.pathname === '/api/certs' && req.method === 'GET') {
     return enviarJson(res, 200, { windows: EH_WINDOWS, certificados: listarCertificadosWindows() }, req);
+  }
+
+  // Abre o seletor de pasta NATIVO do Windows e devolve o caminho escolhido.
+  // (O navegador não consegue entregar um caminho ao agente; quem abre o
+  // diálogo é o agente, que roda localmente.)
+  if (url.pathname === '/api/escolher-pasta' && req.method === 'GET') {
+    if (!EH_WINDOWS) return enviarJson(res, 400, { erro: 'seleção de pasta só no Windows' }, req);
+    const ps =
+      'Add-Type -AssemblyName System.Windows.Forms; ' +
+      '$d = New-Object System.Windows.Forms.FolderBrowserDialog; ' +
+      "$d.Description = 'Escolha a pasta para salvar os XMLs'; $d.ShowNewFolderButton = $true; " +
+      '$d.RootFolder = [System.Environment+SpecialFolder]::MyComputer; ' +
+      'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }';
+    try {
+      const out = execFileSync(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-STA', '-Command', ps],
+        { encoding: 'utf-8', timeout: 180000 },
+      );
+      return enviarJson(res, 200, { pasta: out.trim() || null }, req);
+    } catch (e) {
+      return enviarJson(res, 400, { erro: `não foi possível abrir o seletor: ${e.message}` }, req);
+    }
   }
 
   if (url.pathname === '/api/baixar' && req.method === 'POST') {
