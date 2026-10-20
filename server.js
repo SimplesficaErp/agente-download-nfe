@@ -77,6 +77,11 @@ function listarCertificadosWindows() {
 // Retorna { pfxPath, passphrase, limpar() }.
 function exportarPfxTemporario(thumbprint) {
   if (!EH_WINDOWS) throw new Error('exportação de certificado só no Windows');
+  // Anti command-injection: thumbprint é interpolado no script PowerShell —
+  // só aceitamos 40 hex E que exista na lista de certificados da máquina.
+  if (!/^[A-Fa-f0-9]{40}$/.test(thumbprint)) throw new Error('thumbprint inválido');
+  if (!listarCertificadosWindows().some((c) => c.thumbprint.toUpperCase() === thumbprint.toUpperCase()))
+    throw new Error('certificado não encontrado na máquina');
   const passphrase = randomBytes(18).toString('base64');
   const pfxPath = join(tmpdir(), `agente-nfe-${randomUUID()}.pfx`);
   const ps =
@@ -209,6 +214,26 @@ function corsHeaders(req) {
   };
 }
 
+// Guarda anti-CSRF / anti-DNS-rebinding das rotas sensíveis. O CORS só impede
+// LER a resposta cross-site, não impede a requisição de EXECUTAR (e disparar um
+// download com o certificado). Então, além do allowlist de Origin:
+//  - Origin, se presente, tem que estar no allowlist (bloqueia sites quaisquer);
+//  - Host tem que ser localhost/127.0.0.1 (um ataque de DNS rebinding chega com
+//    outro Host, ex.: evil.com:3131 → recusado).
+function requisicaoLocalOk(req) {
+  const origin = req.headers.origin;
+  if (origin && !ORIGENS_PERMITIDAS.has(origin)) return false;
+  const host = String(req.headers.host || '').toLowerCase();
+  return /^(127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(host);
+}
+
+// Caminho local seguro: absoluto, sem UNC (\\servidor) nem device path (\\?\).
+function caminhoLocalValido(p) {
+  const s = String(p || '');
+  if (!s || s.startsWith('\\\\') || /^\\\\\?\\/.test(s) || s.includes('\0')) return false;
+  return /^[A-Za-z]:[\\/]/.test(s) || s.startsWith('/'); // C:\... ou /... (mac/linux)
+}
+
 function enviarJson(res, status, dados, req) {
   const body = JSON.stringify(dados);
   res.writeHead(status, {
@@ -252,11 +277,17 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // A partir daqui, só rotas sensíveis — exigem requisição local legítima.
+  if (!requisicaoLocalOk(req)) return enviarJson(res, 403, { erro: 'origem não autorizada' }, req);
+
   if (url.pathname === '/api/certs' && req.method === 'GET') {
     return enviarJson(res, 200, { windows: EH_WINDOWS, certificados: listarCertificadosWindows() }, req);
   }
 
   if (url.pathname === '/api/baixar' && req.method === 'POST') {
+    // Exige JSON — força preflight em chamadas cross-site (anti-CSRF por form).
+    if (!String(req.headers['content-type'] || '').includes('application/json'))
+      return enviarJson(res, 415, { erro: 'Content-Type deve ser application/json' }, req);
     const b = await lerBody(req);
     const chaves = [...new Set((b.chaves || []).map(soDigitos).filter((c) => c.length === 44))];
     const uf = String(b.uf || '').toUpperCase();
@@ -266,6 +297,8 @@ const server = createServer(async (req, res) => {
 
     if (chaves.length === 0) return enviarJson(res, 400, { erro: 'nenhuma chave válida (44 dígitos)' }, req);
     if (!cUFAutor) return enviarJson(res, 400, { erro: 'UF do autor inválida' }, req);
+    if (b.destino && !caminhoLocalValido(destino))
+      return enviarJson(res, 400, { erro: 'pasta de destino inválida (sem UNC/rede)' }, req);
 
     // Resolve o material do certificado: thumbprint (store) ou arquivo .pfx.
     let pfxBuf;
@@ -283,6 +316,8 @@ const server = createServer(async (req, res) => {
           cnpj = soDigitos(c?.cnpj);
         }
       } else if (b.pfxPath) {
+        if (!caminhoLocalValido(b.pfxPath) || !/\.(pfx|p12)$/i.test(b.pfxPath))
+          return enviarJson(res, 400, { erro: 'caminho .pfx inválido (sem UNC/rede; extensão .pfx/.p12)' }, req);
         if (!existsSync(b.pfxPath)) return enviarJson(res, 400, { erro: 'arquivo .pfx não encontrado' }, req);
         pfxBuf = readFileSync(b.pfxPath);
         passphrase = String(b.senha || '');
