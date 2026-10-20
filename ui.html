@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agente de Download de NFe</title>
+<style>
+  :root {
+    --navy: #0f1b35; --navy-2: #16274a; --gold: #c9a24b; --gold-2: #e3c270;
+    --bg: #f4f6fb; --card: #fff; --ink: #11203d; --muted: #5a6a85; --line: #e2e8f4;
+    --ok: #157347; --ok-bg: #e4f3ea; --warn: #9a6a00; --warn-bg: #fbf1d9;
+    --err: #b42318; --err-bg: #fbe9e7; --shadow: 0 1px 3px rgba(16,32,61,.08), 0 8px 24px rgba(16,32,61,.06);
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg:#0a1223; --card:#10203d; --ink:#e9eefb; --muted:#93a2c2; --line:#23375f;
+    --ok-bg:#11301f; --warn-bg:#2e2410; --err-bg:#311512; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { background:linear-gradient(135deg,var(--navy),var(--navy-2)); color:#fff;
+    padding:22px 0; border-bottom:3px solid var(--gold); }
+  .wrap { max-width:1000px; margin:0 auto; padding:0 16px; }
+  .brand { display:flex; align-items:center; gap:12px; }
+  .logo { width:38px; height:38px; border-radius:9px; flex:none;
+    background:linear-gradient(135deg,var(--gold),var(--gold-2)); display:grid; place-items:center;
+    color:var(--navy); font-weight:800; font-size:18px; }
+  h1 { font-size:19px; margin:0; } .sub { font-size:12.5px; color:#b9c6e4; margin-top:2px; }
+  main { padding:22px 0 60px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:14px;
+    box-shadow:var(--shadow); padding:18px; margin-bottom:16px; }
+  .panel h2 { font-size:13px; margin:0 0 12px; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.7px; }
+  label { display:block; font-size:12.5px; color:var(--muted); margin:0 0 4px; }
+  .grid { display:grid; grid-template-columns:1fr 120px 160px; gap:12px; }
+  @media (max-width:640px){ .grid { grid-template-columns:1fr; } }
+  select, input, textarea { width:100%; padding:9px 11px; border:1px solid var(--line);
+    border-radius:9px; background:var(--bg); color:var(--ink); font:inherit; }
+  textarea { min-height:120px; resize:vertical; font:13px/1.6 ui-monospace,Menlo,monospace; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button { font:inherit; font-weight:650; cursor:pointer; border-radius:9px; border:1px solid transparent;
+    padding:10px 18px; transition:filter .15s; } button:hover{ filter:brightness(1.06); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .btn-primary { background:var(--navy); color:#fff; } .btn-gold { background:var(--gold); color:var(--navy); }
+  .btn-ghost { background:transparent; border-color:var(--line); color:var(--ink); }
+  .btn-sm { padding:6px 12px; font-size:13px; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:9px; overflow:hidden; }
+  .seg button { border-radius:0; border:none; background:var(--card); color:var(--muted); padding:8px 14px; }
+  .seg button.active { background:var(--navy); color:#fff; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }
+  td.chave { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; }
+  .pill { font-size:11px; font-weight:650; padding:3px 9px; border-radius:999px; white-space:nowrap; }
+  .pill.ok { background:var(--ok-bg); color:var(--ok); } .pill.erro { background:var(--err-bg); color:var(--err); }
+  .pill\.sem-retorno,.pill.sem-retorno { background:var(--warn-bg); color:var(--warn); }
+  .muted { color:var(--muted); font-size:12.5px; } .mono { font-family:ui-monospace,Menlo,monospace; }
+  .note { background:var(--warn-bg); color:var(--warn); border-radius:9px; padding:10px 12px; font-size:13px; margin-bottom:12px; }
+  .hide { display:none; }
+  .toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--navy); color:#fff;
+    padding:11px 18px; border-radius:10px; box-shadow:var(--shadow); opacity:0; transition:opacity .2s; z-index:9; }
+  .toast.show { opacity:1; }
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,.4);
+    border-top-color:#fff; border-radius:50%; animation:r .7s linear infinite; vertical-align:-2px; }
+  @keyframes r { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<header><div class="wrap brand">
+  <div class="logo">N</div>
+  <div><h1>Agente de Download de NFe</h1>
+  <div class="sub">Certificado local · SEFAZ · sem guardar nada</div></div>
+</div></header>
+
+<main class="wrap">
+  <div class="note" id="note-plat"></div>
+
+  <div class="panel">
+    <h2>Certificado</h2>
+    <div class="seg" id="origem" style="margin-bottom:12px;">
+      <button data-o="store" class="active">Instalado na máquina</button>
+      <button data-o="file">Arquivo .pfx</button>
+    </div>
+
+    <div id="box-store">
+      <div class="row">
+        <div style="flex:1 1 320px;">
+          <label>Escolha o certificado</label>
+          <select id="cert"></select>
+        </div>
+        <button class="btn-ghost btn-sm" id="btn-reload" style="align-self:flex-end;">Atualizar lista</button>
+      </div>
+    </div>
+
+    <div id="box-file" class="hide">
+      <div class="grid" style="grid-template-columns:1fr 200px;">
+        <div><label>Caminho do arquivo .pfx</label>
+          <input id="pfxPath" class="mono" placeholder="C:\\certs\\empresa.pfx" /></div>
+        <div><label>Senha do .pfx</label>
+          <input id="senha" type="password" placeholder="••••••" /></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Parâmetros</h2>
+    <div class="grid">
+      <div><label>CNPJ do autor (titular do certificado)</label>
+        <input id="cnpj" class="mono" placeholder="14 dígitos (auto se detectado)" /></div>
+      <div><label>UF do autor</label>
+        <select id="uf"></select></div>
+      <div><label>Ambiente</label>
+        <div class="seg" id="amb">
+          <button data-a="1" class="active">Produção</button>
+          <button data-a="2">Homolog.</button>
+        </div></div>
+    </div>
+    <div style="margin-top:12px;"><label>Pasta de destino (vazio = pasta XMLs do agente)</label>
+      <input id="destino" class="mono" placeholder="C:\\Users\\voce\\Downloads\\XMLs" /></div>
+  </div>
+
+  <div class="panel">
+    <h2>Chaves (44 dígitos, uma por linha)</h2>
+    <textarea id="chaves" placeholder="Cole aqui as chaves de acesso. Pontuação e espaços são ignorados."></textarea>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn-gold" id="btn-baixar">Baixar XMLs</button>
+      <span class="muted" id="status"></span>
+    </div>
+  </div>
+
+  <div class="panel hide" id="box-result">
+    <h2 id="result-title">Resultado</h2>
+    <div class="muted" id="result-dest" style="margin-bottom:10px;"></div>
+    <table><thead><tr><th>Chave</th><th>Status</th><th>Detalhe</th></tr></thead>
+      <tbody id="result-body"></tbody></table>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const UFS = ['AC','AL','AM','AP','BA','CE','DF','ES','GO','MA','MG','MS','MT','PA','PB','PE','PI','PR','RJ','RN','RO','RR','RS','SC','SE','SP','TO'];
+let origem = 'store', ambiente = 1;
+
+function toast(m){ const t=$('#toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),2800); }
+
+$('#uf').innerHTML = '<option value="">—</option>' + UFS.map(u=>`<option>${u}</option>`).join('');
+
+$('#origem').onclick = (e)=>{ const b=e.target.closest('button'); if(!b) return; origem=b.dataset.o;
+  [...$('#origem').children].forEach(x=>x.classList.toggle('active',x===b));
+  $('#box-store').classList.toggle('hide', origem!=='store');
+  $('#box-file').classList.toggle('hide', origem!=='file'); };
+$('#amb').onclick = (e)=>{ const b=e.target.closest('button'); if(!b) return; ambiente=Number(b.dataset.a);
+  [...$('#amb').children].forEach(x=>x.classList.toggle('active',x===b)); };
+
+async function carregarCerts(){
+  try{
+    const r = await (await fetch('/api/certs')).json();
+    if(!r.windows){
+      $('#note-plat').textContent = 'Fora do Windows: a leitura de certificados instalados não está disponível. Use a opção "Arquivo .pfx".';
+      $('#origem').querySelector('[data-o="file"]').click();
+    } else { $('#note-plat').classList.add('hide'); }
+    const sel = $('#cert');
+    if(!r.certificados.length){ sel.innerHTML = '<option value="">Nenhum certificado com chave privada encontrado</option>'; return; }
+    sel.innerHTML = r.certificados.map(c=>{
+      const venc = c.validadeAte ? ' · vence '+c.validadeAte : '';
+      const cj = c.cnpj ? ' · '+c.cnpj : '';
+      return `<option value="${c.thumbprint}" data-cnpj="${c.cnpj||''}">${c.nome}${cj}${venc}</option>`;
+    }).join('');
+    sincronizarCnpj();
+  }catch(e){ toast('Erro ao listar certificados: '+e.message); }
+}
+function sincronizarCnpj(){
+  const opt = $('#cert').selectedOptions[0];
+  if(opt && opt.dataset.cnpj && !$('#cnpj').value) $('#cnpj').value = opt.dataset.cnpj;
+}
+$('#cert').onchange = sincronizarCnpj;
+$('#btn-reload').onclick = carregarCerts;
+
+$('#btn-baixar').onclick = async ()=>{
+  const chaves = $('#chaves').value.split(/\r?\n/).map(x=>x.replace(/\D/g,'')).filter(x=>x.length===44);
+  if(!chaves.length) return toast('Cole ao menos uma chave de 44 dígitos.');
+  if(!$('#uf').value) return toast('Escolha a UF do autor.');
+  const payload = { chaves, uf:$('#uf').value, tpAmb:ambiente, cnpj:$('#cnpj').value, destino:$('#destino').value };
+  if(origem==='store'){ payload.thumbprint = $('#cert').value; if(!payload.thumbprint) return toast('Escolha um certificado.'); }
+  else { payload.pfxPath = $('#pfxPath').value; payload.senha = $('#senha').value;
+    if(!payload.pfxPath) return toast('Informe o caminho do .pfx.'); }
+
+  const btn=$('#btn-baixar'); btn.disabled=true;
+  $('#status').innerHTML = '<span class="spin"></span> Consultando a SEFAZ…';
+  try{
+    const r = await fetch('/api/baixar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.erro||('HTTP '+r.status));
+    $('#box-result').classList.remove('hide');
+    $('#result-title').textContent = `Resultado — ${d.baixadas}/${d.total} baixada(s)`;
+    $('#result-dest').innerHTML = 'Salvos em: <span class="mono">'+d.destino+'</span>';
+    $('#result-body').innerHTML = d.resultados.map(x=>
+      `<tr><td class="chave">${x.chave}</td>`+
+      `<td><span class="pill ${x.status}">${x.status}</span></td>`+
+      `<td class="muted">${x.mensagem||''}${x.arquivos?(' · '+x.arquivos.length+' arquivo(s)'):''}</td></tr>`).join('');
+    toast(d.baixadas+' XML(s) baixado(s)');
+  }catch(e){ toast('Erro: '+e.message); }
+  finally{ btn.disabled=false; $('#status').textContent=''; }
+};
+
+carregarCerts();
+</script>
+</body>
+</html>

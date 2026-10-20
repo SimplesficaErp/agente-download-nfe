@@ -1,0 +1,12 @@
+{
+  "name": "agente-nfe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agente local de download de XML de NFe pela SEFAZ usando o certificado A1 instalado na maquina (independente). So dependencias nativas do Node.",
+  "bin": { "agente-nfe": "server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=18" }
+}

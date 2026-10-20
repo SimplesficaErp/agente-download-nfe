@@ -1,0 +1,8 @@
+*.exe
+*.blob
+node-x64.exe
+nx64/
+*.log
+XMLs/
+sea-config.json
+standalone.js
