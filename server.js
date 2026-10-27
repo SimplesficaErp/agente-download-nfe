@@ -4,17 +4,19 @@
 // faz mTLS com a SEFAZ (NFeDistribuicaoDFe / consChNFe) e salva o XML.
 // Só módulos nativos do Node. Escuta só em 127.0.0.1.
 
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { createReadStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { request as httpsRequest } from 'node:https';
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
+import { isSea } from 'node:sea';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
+const VERSAO = '0.2.0';
 const PORT = Number(process.env.AGENTE_PORT) || 3131;
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const EH_WINDOWS = process.platform === 'win32';
@@ -141,7 +143,7 @@ function postSefaz(urlStr, envelope, pfxBuf, passphrase) {
           'Content-Type':
             'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"',
           // Sem User-Agent o WAF da Fazenda devolve HTTP 403. Mandar um.
-          'User-Agent': 'AgenteNFe/0.1 (+https://chaves-nfe.devgogroup.com)',
+          'User-Agent': `AgenteNFe/${VERSAO} (+https://chaves-nfe.devgogroup.com)`,
           Accept: 'application/soap+xml, text/xml, */*',
           'Content-Length': body.length,
         },
@@ -199,6 +201,224 @@ async function baixarChave({ chNFe, cUFAutor, tpAmb, cnpj, pfxBuf, passphrase, d
   return { chave: chNFe, status: 'ok', mensagem: `cStat ${cStat}: ${xMotivo}`, arquivos };
 }
 
+// ---------- NFS-e Nacional (ADN): distribuição de DF-e por NSU ----------
+// GET {base}/DFe/{NSU} com mTLS → { StatusProcessamento, LoteDFe:[{NSU, ChaveAcesso, TipoDocumento,
+// ArquivoXml (gzip+base64)}], MaxNSU? }; 404 = nada a partir do NSU. Hosts fixos por ambiente.
+// AGENTE_ADN_BASE só existe para o teste automatizado (servidor ADN falso em 127.0.0.1).
+const ADN = {
+  producao: process.env.AGENTE_ADN_BASE || 'https://adn.nfse.gov.br/contribuintes',
+  homologacao: 'https://adn.producaorestrita.nfse.gov.br/contribuintes',
+};
+
+// PFX exportado da loja do Windows fica só em memória por alguns minutos (cada export custa ~1 s
+// de PowerShell e a busca pede dezenas de lotes seguidos). O arquivo temporário é apagado na hora.
+const CACHE_PFX_MS = 10 * 60_000;
+const cachePfx = new Map();
+
+function pfxDoThumbprint(thumbprint) {
+  const t = thumbprint.toUpperCase();
+  const c = cachePfx.get(t);
+  if (c && c.expira > Date.now()) return c;
+  const exp = exportarPfxTemporario(t);
+  try {
+    const item = { pfxBuf: readFileSync(exp.pfxPath), passphrase: exp.passphrase, expira: Date.now() + CACHE_PFX_MS };
+    cachePfx.set(t, item);
+    return item;
+  } finally {
+    exp.limpar();
+  }
+}
+
+// Certificado instalado com a mesma raiz de CNPJ (8 dígitos), válido, o de validade mais longa.
+function certificadoDoCnpj(cnpj) {
+  const raiz = soDigitos(cnpj).slice(0, 8);
+  const hoje = new Date().toISOString().slice(0, 10);
+  return (
+    listarCertificadosWindows()
+      .filter((c) => c.cnpj && c.cnpj.slice(0, 8) === raiz && c.validadeAte >= hoje)
+      .sort((a, b) => b.validadeAte.localeCompare(a.validadeAte))[0] ?? null
+  );
+}
+
+function getAdn(urlStr, pfxBuf, passphrase) {
+  return new Promise((resolve, reject) => {
+    const agent = new HttpsAgent({ pfx: pfxBuf, passphrase, minVersion: 'TLSv1.2', keepAlive: false });
+    const req = httpsRequest(
+      urlStr,
+      { method: 'GET', agent, headers: { Accept: 'application/json', 'User-Agent': `AgenteGoGroup/${VERSAO}` }, timeout: 60000 },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf-8') }));
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('tempo esgotado falando com o ADN')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function xmlDoAdn(b64) {
+  if (typeof b64 !== 'string' || !b64) return null;
+  const bruto = Buffer.from(b64, 'base64');
+  try {
+    return gunzipSync(bruto).toString('utf-8');
+  } catch {
+    const texto = bruto.toString('utf-8');
+    return texto.trimStart().startsWith('<') ? texto : null;
+  }
+}
+
+function inteiroOuNull(v) {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function mensagemAdn(body) {
+  try {
+    const j = JSON.parse(body);
+    const erros = j.Erros || j.erros;
+    const d = (erros && erros[0] && (erros[0].Descricao || erros[0].descricao)) || j.message || j.mensagem;
+    if (typeof d === 'string') return d.slice(0, 300);
+  } catch {}
+  return String(body || '').slice(0, 200);
+}
+
+function erroComStatus(mensagem, status) {
+  const e = new Error(mensagem);
+  e.status = status;
+  return e;
+}
+
+// Um lote (até 50 documentos) a partir de `nsu`. Devolve só os campos que o app aceita.
+async function loteNfse({ ambiente, nsu, pfxBuf, passphrase }) {
+  const r = await getAdn(`${ADN[ambiente]}/DFe/${nsu}`, pfxBuf, passphrase);
+  if (r.status === 404) return { status: 'SEM_DOCUMENTOS', documentos: [], maxNsu: null };
+  if (r.status < 200 || r.status >= 300) {
+    const status = r.status === 401 || r.status === 403 ? 403 : r.status === 429 ? 429 : 502;
+    throw erroComStatus(`ADN recusou (HTTP ${r.status}): ${mensagemAdn(r.body)}`, status);
+  }
+  let j;
+  try {
+    j = r.body ? JSON.parse(r.body) : {};
+  } catch {
+    throw erroComStatus('ADN respondeu algo que não é JSON', 502);
+  }
+  const documentos = [];
+  for (const d of Array.isArray(j.LoteDFe) ? j.LoteDFe : []) {
+    const n = inteiroOuNull(d.NSU ?? d.nsu);
+    if (n === null || n < 1) continue;
+    const t = String(d.TipoDocumento ?? d.tipoDocumento ?? '').toUpperCase();
+    const chave = d.ChaveAcesso ?? d.chaveAcesso;
+    documentos.push({
+      nsu: n,
+      tipo: t === 'NFSE' ? 'NFSE' : t === 'EVENTO' ? 'EVENTO' : 'OUTRO',
+      chave: typeof chave === 'string' ? chave.slice(0, 60) : null,
+      xml: xmlDoAdn(d.ArquivoXml ?? d.arquivoXml),
+    });
+  }
+  return {
+    status: String(j.StatusProcessamento ?? (documentos.length ? 'DOCUMENTOS_LOCALIZADOS' : 'SEM_DOCUMENTOS')).slice(0, 60),
+    documentos,
+    maxNsu: inteiroOuNull(j.MaxNSU ?? j.maxNSU ?? j.UltimoNSU),
+  };
+}
+
+// ---------- Instalação e modo escondido (Windows) ----------
+// Duplo clique no .exe baixado: copia para %LOCALAPPDATA%\AgenteGoGroup, registra o protocolo
+// agente-gogroup:// (o app abre o agente com um clique) e a inicialização com o Windows, e sobe a
+// cópia instalada SEM JANELA (wscript + Run(..., 0)). Depois disso não aparece mais nada na tela.
+const NOME_EXE = 'agente-gogroup.exe';
+const PASTA_INSTALACAO = join(process.env.LOCALAPPDATA || tmpdir(), 'AgenteGoGroup');
+const EXE_INSTALADO = join(PASTA_INSTALACAO, NOME_EXE);
+const VBS_INICIAR = join(PASTA_INSTALACAO, 'iniciar.vbs');
+const LOG = join(PASTA_INSTALACAO, 'agente.log');
+const LOG_MAX_BYTES = 1_000_000;
+const CHAVE_PROTOCOLO = 'HKCU\\Software\\Classes\\agente-gogroup';
+const CHAVE_INICIO = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const ASPA = '"';
+
+function ehExecutavelEmpacotado() {
+  try {
+    return isSea();
+  } catch {
+    return false;
+  }
+}
+
+function reg(argumentos) {
+  execFileSync('reg', argumentos, { stdio: 'ignore', windowsHide: true, timeout: 15000 });
+}
+
+function iniciarEscondido() {
+  spawn('wscript.exe', [VBS_INICIAR], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+}
+
+async function encerrarAgenteRodando() {
+  // Versão nova: pede para sair. Versão 0.1 (janela de console): encerra pelo nome.
+  try {
+    await fetch(`http://127.0.0.1:${PORT}/api/encerrar`, { method: 'POST', signal: AbortSignal.timeout(2000) });
+  } catch {}
+  for (const nome of [NOME_EXE, 'agente-nfe.exe', 'agente-nfe-x64.exe']) {
+    try {
+      execFileSync('taskkill', ['/F', '/IM', nome], { stdio: 'ignore', windowsHide: true });
+    } catch {}
+  }
+  await new Promise((ok) => setTimeout(ok, 800));
+}
+
+// VBScript: aspas dentro de string são dobradas. Run(cmd, 0, False) = sem janela, sem esperar.
+function scriptIniciar() {
+  const exe = EXE_INSTALADO.replace(/"/g, ASPA + ASPA);
+  const comando = `${ASPA}${ASPA}${exe}${ASPA}${ASPA} --servico`;
+  return `CreateObject(${ASPA}WScript.Shell${ASPA}).Run ${ASPA}${comando}${ASPA}, 0, False\r\n`;
+}
+
+async function instalar() {
+  console.log(`\n  Instalando o Agente GoGroup ${VERSAO}…`);
+  await encerrarAgenteRodando();
+  mkdirSync(PASTA_INSTALACAO, { recursive: true });
+  copyFileSync(process.execPath, EXE_INSTALADO);
+  writeFileSync(VBS_INICIAR, scriptIniciar(), 'utf-8');
+  const comando = `wscript.exe ${ASPA}${VBS_INICIAR}${ASPA}`;
+  reg(['add', CHAVE_PROTOCOLO, '/ve', '/d', 'URL:Agente GoGroup', '/f']);
+  reg(['add', CHAVE_PROTOCOLO, '/v', 'URL Protocol', '/d', '', '/f']);
+  reg(['add', `${CHAVE_PROTOCOLO}\\shell\\open\\command`, '/ve', '/d', comando, '/f']);
+  reg(['add', CHAVE_INICIO, '/v', 'AgenteGoGroup', '/d', comando, '/f']);
+  iniciarEscondido();
+  console.log('  Pronto: o agente roda escondido e abre sozinho com o Windows.');
+  console.log('  Pode fechar esta janela e voltar para o navegador.\n');
+  await new Promise((ok) => setTimeout(ok, 4000));
+}
+
+async function desinstalar() {
+  await encerrarAgenteRodando();
+  try {
+    reg(['delete', CHAVE_PROTOCOLO, '/f']);
+  } catch {}
+  try {
+    reg(['delete', CHAVE_INICIO, '/v', 'AgenteGoGroup', '/f']);
+  } catch {}
+  console.log('  Agente desinstalado (a pasta pode ser apagada):', PASTA_INSTALACAO);
+}
+
+// Sem janela não há console: o que o agente escreveria vai para agente.log (zerado acima de 1 MB).
+function logarEmArquivo() {
+  try {
+    mkdirSync(PASTA_INSTALACAO, { recursive: true });
+    if (existsSync(LOG) && statSync(LOG).size > LOG_MAX_BYTES) writeFileSync(LOG, '');
+  } catch {}
+  const escrever =
+    (nivel) =>
+    (...partes) => {
+      try {
+        appendFileSync(LOG, `${new Date().toISOString()} ${nivel} ${partes.map(String).join(' ')}\r\n`);
+      } catch {}
+    };
+  console.log = escrever('INFO');
+  console.error = escrever('ERRO');
+}
+
 // ---------- HTTP server (só 127.0.0.1) ----------
 // A página pública do GoDeploy roda em HTTPS e chama este agente no localhost.
 // Só liberamos CORS (+ Private Network Access) para ESSAS origens — senão
@@ -208,6 +428,8 @@ async function baixarChave({ chNFe, cUFAutor, tpAmb, cnpj, pfxBuf, passphrase, d
 const ORIGENS_PERMITIDAS = new Set([
   'https://chaves-nfe.devgogroup.com',
   'https://c2757aa7.devgogroup.com',
+  'https://agente-mkp.devgogroup.com',
+  'https://2da00850.devgogroup.com',
 ]);
 
 function corsHeaders(req) {
@@ -292,6 +514,56 @@ const server = createServer(async (req, res) => {
 
   // A partir daqui, só rotas sensíveis — exigem requisição local legítima.
   if (!requisicaoLocalOk(req)) return enviarJson(res, 403, { erro: 'origem não autorizada' }, req);
+
+  if (url.pathname === '/api/saude' && req.method === 'GET') {
+    return enviarJson(res, 200, { ok: true, versao: VERSAO, windows: EH_WINDOWS }, req);
+  }
+
+  // Só a própria máquina (sem Origin): usado pelo instalador para trocar de versão.
+  if (url.pathname === '/api/encerrar' && req.method === 'POST') {
+    if (req.headers.origin) return enviarJson(res, 403, { erro: 'origem não autorizada' }, req);
+    enviarJson(res, 200, { ok: true }, req);
+    setTimeout(() => process.exit(0), 100);
+    return;
+  }
+
+  // Lote da NFS-e Nacional (ADN). O certificado é o INSTALADO com a raiz do CNPJ pedido (ou um
+  // .pfx, fora do Windows). JSON obrigatório: chamada cross-site precisa de preflight (anti-CSRF).
+  if (url.pathname === '/api/nfse/dfe' && req.method === 'POST') {
+    if (!String(req.headers['content-type'] || '').includes('application/json'))
+      return enviarJson(res, 415, { erro: 'Content-Type deve ser application/json' }, req);
+    const b = await lerBody(req);
+    const cnpj = soDigitos(b.cnpj);
+    const nsu = Number(b.nsu);
+    const ambiente = b.ambiente === 'homologacao' ? 'homologacao' : 'producao';
+    if (cnpj.length !== 14) return enviarJson(res, 400, { erro: 'CNPJ da empresa inválido' }, req);
+    if (!Number.isSafeInteger(nsu) || nsu < 0) return enviarJson(res, 400, { erro: 'NSU inválido' }, req);
+    let pfxBuf;
+    let passphrase;
+    try {
+      if (b.pfxPath) {
+        if (!caminhoLocalValido(b.pfxPath) || !/\.(pfx|p12)$/i.test(b.pfxPath))
+          return enviarJson(res, 400, { erro: 'caminho .pfx inválido (sem UNC/rede; extensão .pfx/.p12)' }, req);
+        if (!existsSync(b.pfxPath)) return enviarJson(res, 400, { erro: 'arquivo .pfx não encontrado' }, req);
+        pfxBuf = readFileSync(b.pfxPath);
+        passphrase = String(b.senha || '');
+      } else {
+        const cert = certificadoDoCnpj(cnpj);
+        if (!cert)
+          return enviarJson(res, 404, { erro: `Nenhum certificado A1 válido da raiz ${cnpj.slice(0, 8)} instalado nesta máquina.` }, req);
+        ({ pfxBuf, passphrase } = pfxDoThumbprint(cert.thumbprint));
+      }
+    } catch (e) {
+      return enviarJson(res, 400, { erro: `falha ao preparar certificado: ${e.message}` }, req);
+    }
+    try {
+      return enviarJson(res, 200, await loteNfse({ ambiente, nsu, pfxBuf, passphrase }), req);
+    } catch (e) {
+      console.error('nfse', e.message);
+      const mensagem = e.message.startsWith('ADN') ? e.message : `falha falando com o ADN: ${e.message}`;
+      return enviarJson(res, e.status || 502, { erro: mensagem }, req);
+    }
+  }
 
   if (url.pathname === '/api/certs' && req.method === 'GET') {
     return enviarJson(res, 200, { windows: EH_WINDOWS, certificados: listarCertificadosWindows() }, req);
@@ -393,10 +665,39 @@ const server = createServer(async (req, res) => {
   enviarJson(res, 404, { erro: 'rota não encontrada' }, req);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  const linha = `  Agente de NFe rodando em  http://localhost:${PORT}  `;
-  const borda = '─'.repeat(linha.length);
-  console.log(`\n┌${borda}┐\n│${linha}│\n└${borda}┘`);
-  console.log(EH_WINDOWS ? '  Modo Windows: lê os certificados instalados.' : '  Fora do Windows: use um arquivo .pfx.');
-  console.log('  Abra o endereço acima no navegador. Ctrl+C para parar.\n');
-});
+function servir(escondido) {
+  if (escondido) logarEmArquivo();
+  server.on('error', (e) => {
+    // Já tem um agente nesta porta (aberto pelo protocolo duas vezes, ou pelo logon): sai calado.
+    if (e.code === 'EADDRINUSE') process.exit(0);
+    console.error('servidor', e.message);
+    process.exit(1);
+  });
+  server.listen(PORT, '127.0.0.1', () => {
+    if (escondido) return console.log(`agente ${VERSAO} em http://localhost:${PORT}`);
+    const linha = `  Agente GoGroup ${VERSAO} rodando em  http://localhost:${PORT}  `;
+    const borda = '─'.repeat(linha.length);
+    console.log(`\n┌${borda}┐\n│${linha}│\n└${borda}┘`);
+    console.log(EH_WINDOWS ? '  Modo Windows: lê os certificados instalados.' : '  Fora do Windows: use um arquivo .pfx.');
+    console.log('  Abra o endereço acima no navegador. Ctrl+C para parar.\n');
+  });
+}
+
+async function principal() {
+  const argumentos = process.argv.slice(2);
+  if (argumentos.includes('--desinstalar')) return desinstalar();
+  if (argumentos.includes('--servico')) return servir(true);
+  if (EH_WINDOWS && ehExecutavelEmpacotado()) {
+    // Duplo clique no já instalado: sobe escondido e some.
+    if (process.execPath.toLowerCase() === EXE_INSTALADO.toLowerCase()) return iniciarEscondido();
+    // Duplo clique no instalador baixado.
+    try {
+      return await instalar();
+    } catch (e) {
+      console.error(`\n  Falha ao instalar: ${e.message}\n  Rodando nesta janela mesmo.\n`);
+    }
+  }
+  servir(false);
+}
+
+principal();

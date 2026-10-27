@@ -1,4 +1,17 @@
-# Agente de Download de NFe
+# Agente GoGroup (download de NFe + NFS-e Nacional)
+
+> **v0.2.0** — instala sozinho e roda **escondido** no Windows. Duplo clique no
+> `agente-gogroup-x64.exe` baixado: ele se copia para `%LOCALAPPDATA%\AgenteGoGroup`, registra o
+> protocolo `agente-gogroup://` (os apps abrem o agente com um clique) e a inicialização com o
+> Windows, e sobe sem janela. Log em `%LOCALAPPDATA%\AgenteGoGroup\agente.log`.
+> Desinstalar: `agente-gogroup.exe --desinstalar`.
+>
+> Serve os apps `chaves-nfe` (XML de NF-e) e `agente-mkp` (NFS-e dos marketplaces:
+> `POST /api/nfse/dfe {cnpj, nsu}` acha o A1 instalado com a raiz do CNPJ, faz mTLS com o ADN e
+> devolve o lote). Build: `node build.cjs` no Mac, depois `build-windows.cmd` no Windows.
+> Teste: `node --test test/nfse.test.mjs` (ADN falso com mTLS de verdade).
+
+## Agente de Download de NFe (v0.1)
 
 Baixa o XML de NF-e direto da SEFAZ usando o **certificado A1 instalado na máquina**
 (ou um arquivo `.pfx`). **Independente** — não guarda certificado, não depende de
